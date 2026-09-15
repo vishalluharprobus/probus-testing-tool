@@ -11,7 +11,7 @@ it:
     - requests that FAILED        (the call errored outright)
     - requests that never ANSWERED (still in flight when we gave up - this is
                                     almost always the one that matters)
-    - console errors              (what the app itself complained about)
+    - console error              (what the app itself complained about)
 
 It logs in and opens screen 1 exactly as a real run does, then waits and
 reports. It creates nothing, so it is safe to run at any write ceiling.
