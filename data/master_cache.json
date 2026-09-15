@@ -1,0 +1,85 @@
+{
+  "discovered_on": "2026-09-14 17:55",
+  "target": "local",
+  "rtos_by_state": {
+    "MH": [
+      "MH-01 Mumbai",
+      "MH-02 Mumbai",
+      "MH-03 Mumbai"
+    ],
+    "GJ": [
+      "GJ-01 Ahmedabad",
+      "GJ-02 Mehsana",
+      "GJ-03 Rajkot"
+    ],
+    "DL": [
+      "DL-01 Delhi",
+      "DL-02 NewDelhi",
+      "DL-03 Delhi"
+    ],
+    "KA": [
+      "KA-01 Bengaluru",
+      "KA-02 Bengaluru",
+      "KA-03 Bengaluru"
+    ]
+  },
+  "vehicles_by_rto": {
+    "MH-01 Mumbai": {
+      "rto": "MH-01 Mumbai",
+      "makes": [
+        "ATHER ENERGY",
+        "BAJAJ",
+        "ELECTROTHERM",
+        "HERO",
+        "HERO ELECTRIC",
+        "HERO HONDA",
+        "HERO MOTOCORP",
+        "HERO ULTRA",
+        "HONDA",
+        "ROYAL ENFIELD",
+        "SUZUKI",
+        "TVS",
+        "YAMAHA"
+      ],
+      "vehicles": []
+    },
+    "GJ-01 Ahmedabad": {
+      "rto": "GJ-01 Ahmedabad",
+      "makes": [
+        "ATHER ENERGY",
+        "BAJAJ",
+        "ELECTROTHERM",
+        "HERO",
+        "HERO ELECTRIC",
+        "HERO HONDA",
+        "HERO MOTOCORP",
+        "HERO ULTRA",
+        "HONDA",
+        "ROYAL ENFIELD",
+        "SUZUKI",
+        "TVS",
+        "YAMAHA"
+      ],
+      "vehicles": []
+    },
+    "DL-01 Delhi": {
+      "rto": "DL-01 Delhi",
+      "makes": [
+        "ATHER ENERGY",
+        "BAJAJ",
+        "ELECTROTHERM",
+        "HERO",
+        "HERO ELECTRIC",
+        "HERO HONDA",
+        "HERO MOTOCORP",
+        "HERO ULTRA",
+        "HONDA",
+        "ROYAL ENFIELD",
+        "SUZUKI",
+        "TVS",
+        "YAMAHA"
+      ],
+      "vehicles": []
+    }
+  }
+}

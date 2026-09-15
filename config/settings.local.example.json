@@ -1,0 +1,6 @@
+{
+  "username": "YOUR_PORTAL_USERNAME",
+  "password": "YOUR_PORTAL_PASSWORD",
+  "write_ceiling": "quote",
+  "test_documents_dir": "C:\\path\\to\\your\\Testing Documents\\<person>"
+}
