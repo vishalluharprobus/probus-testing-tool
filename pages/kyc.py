@@ -33,6 +33,7 @@ from config.insurers import (DOCUMENTS as config_DOCUMENTS,
                              UNKNOWN as config_UNKNOWN)
 from core import documents, ui
 from data.customer import Customer
+from pages import routes
 
 
 # Find the button that closes whatever dialog is on screen, WITHOUT knowing what
@@ -51,6 +52,11 @@ from data.customer import Customer
 #
 # The dialog's message is read by climbing to the nearest positioned ancestor,
 # which is the popup box in every layout, rather than from a class name.
+#
+# Every kind of popup the portal uses, for "has the KYC answer arrived?".
+# The success message is a SweetAlert box (.swal2-popup role=dialog).
+DIALOGS = ".swal2-popup, .modal-body, mat-dialog-container"
+
 FIND_DISMISS_JS = r"""
 () => {
   // Dismissal words ONLY. "Proceed" and "Continue" are deliberately absent:
@@ -201,6 +207,8 @@ class KycPage:
         # Set when KYC hands us off to an external portal. Recorded rather than
         # merely detected, because the host is the fact worth writing down.
         self.redirected_to: str = ""
+        # The tab the insurer's site opened in, when it is NOT this one.
+        self.redirect_tab: Page | None = None
         self._our_host: str = ""
 
     # ------------------------------------------------------- which shape is it?
@@ -235,11 +243,14 @@ class KycPage:
 
             if host and our_host and host != our_host:
                 return config_REDIRECT, host
+            foreign = self._foreign_tab()
+            if foreign:
+                return config_REDIRECT, foreign
 
-            if "/two-wheeler/proposal" in url:
+            if routes.on(url, "proposal"):
                 return config_SKIPPED, url
 
-            if self.URL_MARKER in url and ui.field_exists(
+            if routes.on(url, "kyc-insurance") and ui.field_exists(
                     self.page, self.PAN, timeout_ms=1200):
                 return (config_DOCUMENTS if self.upload_step_showing(timeout_ms=1500)
                         else config_INLINE), url
@@ -252,11 +263,12 @@ class KycPage:
     # ------------------------------------------------------------------ state
 
     def is_showing(self) -> bool:
-        return (self.URL_MARKER in self.page.url
+        return (routes.on(self.page.url, "kyc-insurance")
                 or ui.field_exists(self.page, self.PAN, timeout_ms=8000))
 
     def wait_until_loaded(self, timeout_ms: int = 45_000) -> "KycPage":
-        self.page.wait_for_url(f"**{self.URL_MARKER}*", timeout=timeout_ms)
+        self.page.wait_for_url(lambda u: routes.on(u, "kyc-insurance"),
+                               timeout=timeout_ms)
         ui.wait_for_screen(self.page, self.PAN, timeout_ms=timeout_ms)
         self.dismiss_popup()
         return self
@@ -306,7 +318,7 @@ class KycPage:
 
     def dialog_text(self) -> str:
         """Whatever the dialog on screen says, or '' if there is none."""
-        for selector in (".modal-body", ".modal-content",
+        for selector in (".swal2-html-container", ".modal-body", ".modal-content",
                          "mat-dialog-container", ".cdk-overlay-pane"):
             try:
                 found = self.page.locator(selector)
@@ -542,12 +554,20 @@ class KycPage:
             "documents"  the upload step appeared
             "proposal"   we moved on - KYC passed with no documents needed
             "dialog"     a message came back (often a failure reason)
+            "redirect"   the browser went to the insurer's own KYC site
             "timeout"    nothing happened in time
         """
         waited = 0
         while waited < timeout_ms:
-            if "/two-wheeler/proposal" in self.page.url:
+            if routes.on(self.page.url, "proposal"):
                 return "proposal"
+            # Gone to the insurer's own site. Without this the loop below sat
+            # out its full 40 seconds looking for dialogs on a page that was
+            # no longer ours.
+            host = _host_of(self.page.url)
+            if self._our_host and ((host and host != self._our_host)
+                                   or self._foreign_tab()):
+                return "redirect"
             try:
                 if self.page.get_by_text("Upload Documents", exact=False
                                          ).first.is_visible(timeout=600):
@@ -555,12 +575,15 @@ class KycPage:
             except Exception:
                 pass
             try:
-                if self.page.locator(".modal-body").first.is_visible(timeout=600):
+                # NATIONAL's "KYC verification success." is a SweetAlert box
+                # (.swal2-popup), not a .modal-body - looking only for the
+                # latter sat out the full 40 seconds with the answer on screen.
+                if self.page.locator(DIALOGS).first.is_visible(timeout=600):
                     return "dialog"
             except Exception:
                 pass
-            self.page.wait_for_timeout(800)
-            waited += 800
+            self.page.wait_for_timeout(500)
+            waited += 500
         return "timeout"
 
     def upload_step_showing(self, timeout_ms: int = 20_000) -> bool:
@@ -865,7 +888,7 @@ class KycPage:
         while waited < timeout_ms:
             url = self.page.url
 
-            if "/two-wheeler/proposal" in url:
+            if routes.on(url, "proposal"):
                 return message                  # we are through
 
             # A REDIRECT can happen HERE, after the form is submitted - not only
@@ -878,13 +901,25 @@ class KycPage:
             if host and self._our_host and host != self._our_host:
                 self.redirected_to = host
                 return f"REDIRECTED to {host}"
+            # ...or in a NEW tab, while this one stays on the KYC screen. Only
+            # watching this tab would sit here for a minute and then report
+            # "never left the KYC screen" - true, and completely misleading.
+            foreign = self._foreign_tab()
+            if foreign:
+                self.redirected_to = foreign
+                return f"REDIRECTED to {foreign} (new tab)"
 
             text = self.dismiss_popup()
             if text:
                 message = text
                 # A dialog usually gates the navigation, so give the app a
-                # moment to move now that it is out of the way.
-                self.page.wait_for_timeout(2500)
+                # moment to move now that it is out of the way - but stop
+                # waiting the instant it does, instead of a flat 2.5 seconds.
+                try:
+                    self.page.wait_for_url(
+                        lambda u: routes.on(u, "proposal"), timeout=2500)
+                except Exception:
+                    pass
                 continue
 
             # Step 2/2 appearing is also "settled" - it means KYC came back and
@@ -911,6 +946,30 @@ class KycPage:
             waited += 1500
 
         return message or "(no message, and never left the KYC screen)"
+
+    def _foreign_tab(self) -> str:
+        """
+        The host of a NEW tab on somebody else's site, or "".
+
+        The other way to redirect: window.open() leaves this tab where it is
+        and puts the insurer in a second one. Tabs on any probusinsurance.com
+        host are ours, whatever this run's own host is.
+        """
+        try:
+            tabs = self.page.context.pages
+        except Exception:
+            return ""
+        for tab in tabs:
+            if tab is self.page or tab.is_closed():
+                continue
+            url = tab.url
+            host = _host_of(url)
+            if (url.startswith(("http://", "https://")) and host
+                    and self._our_host and host != self._our_host
+                    and not host.endswith("probusinsurance.com")):
+                self.redirect_tab = tab
+                return host
+        return ""
 
 
 def _host_of(url: str) -> str:

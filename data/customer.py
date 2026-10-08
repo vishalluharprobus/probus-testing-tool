@@ -66,8 +66,11 @@ class Customer:
     salutation_choices: tuple = ("Mr", "Mr.", "MR", "Shri", "Sri")
     marital_choices: tuple = ("Single", "SINGLE", "Unmarried", "UNMARRIED")
     relation_choices: tuple = ("Father", "FATHER", "Other", "OTHER")
-    address1: str = "A1"
-    address2: str = "A1"
+    # A made-up but real-looking address. "A1" / "A1" passed our own form and
+    # the company-specific quote, then NATIONAL's proposal (InsureMO
+    # calculateWithUW) answered only "NIC-PA-Validation-B5149" - 2026-10-01.
+    address1: str = "12 Shanti Nagar Society"
+    address2: str = "Near Navrangpura Bus Stand"
     address3: str = ""
     state: str = "GUJARAT"
     city: str = "Ahmedabad"
@@ -83,6 +86,9 @@ class Customer:
     # --- previous policy (terms & conditions screen) ------------------------
     previous_policy_number: str = "213654978"
     previous_claim_made: str = "No"
+    # Asked for only when the quote said a claim was made (yourClaimAmount);
+    # leaving it blank stopped every claim journey at the terms step.
+    previous_claim_amount: str = "5000"
 
     # --- KYC documents ------------------------------------------------------
     # The document TYPE chosen in the dropdown...
@@ -178,7 +184,7 @@ def form_values(who: "Customer") -> dict[str, str]:
         "nominee age": "",
         "previous policy number": who.previous_policy_number,
         "additional contact": "",          # optional - deliberately left blank
-        "claim amount": "",                # only wanted when a claim was made
+        "claim amount": who.previous_claim_amount,   # shown only when a claim was made
         "middle name": who.middle_name,
         "first name": who.first_name,
         "last name": who.last_name,

@@ -252,6 +252,10 @@ def click_button(page: Page, label: str) -> None:
     visible AND enabled, and say so plainly if there is none.
     """
     button = live_button(page, label)
+    if button is None and wait_while_busy(page):
+        # The screen was busy answering a call - look again now it is done.
+        page.wait_for_timeout(1500)
+        button = live_button(page, label)
     if button is None:
         # Fall back to the accessible-name lookup rather than giving up: if the
         # text has been restyled into something our match misses, the a11y name
@@ -270,6 +274,45 @@ def click_button(page: Page, label: str) -> None:
             f"No visible, enabled button reading '{label}' on this screen.")
     button.scroll_into_view_if_needed(timeout=4000)
     button.click(timeout=FIELD_TIMEOUT_MS)
+
+
+INVALID_CONTROLS_JS = r"""
+() => [...document.querySelectorAll('[formcontrolname].ng-invalid')]
+  .filter(el => el.offsetParent !== null)          // on screen, not a hidden tab
+  .map(el => [el.getAttribute('formcontrolname'),
+              (el.value || el.innerText || '').trim().slice(0, 40)])
+"""
+
+
+def invalid_controls(page: Page) -> list[tuple[str, str]]:
+    """
+    The visible form controls Angular marks invalid, as (name, value).
+
+    This is how a grey Proceed is explained. The app often shows no message at
+    all - a 4-year-old car on OD Only gets a TP expiry date that can only be in
+    the past, and the screen just will not move - so the answer is read from
+    the form itself.
+    """
+    try:
+        return [(name, value) for name, value in page.evaluate(INVALID_CONTROLS_JS)]
+    except Exception:
+        return []
+
+
+def proceed_blocked(page: Page, settle_ms: int = 2500) -> list[tuple[str, str]] | None:
+    """
+    None when Proceed can be pressed; otherwise the invalid controls that hold
+    it back (possibly an empty list, when the form gives no clue).
+
+    Looks twice, a moment apart: a value the app is still writing can make a
+    control invalid for a few hundred milliseconds.
+    """
+    if button_enabled(page, "Proceed"):
+        return None
+    page.wait_for_timeout(settle_ms)
+    if button_enabled(page, "Proceed"):
+        return None
+    return invalid_controls(page)
 
 
 def field_exists(page: Page, form_control: str, timeout_ms: int = 3000) -> bool:
@@ -309,10 +352,41 @@ def stuck_loading(page: Page) -> bool:
         return False
 
 
+# Set by a runner that watches the network (core/labjourney.Wire): returns
+# True while one of the app's own API calls is still on its way. "Loading"
+# then means "waiting for an answer" - an insurer's KYC check or a document
+# upload can take a minute or more - not "stuck". None = nobody is watching,
+# and the checks below behave exactly as they always have.
+in_flight = None
+BUSY_WAIT_S = 180
+
+
+def wait_while_busy(page: Page, limit_s: int = BUSY_WAIT_S) -> bool:
+    """Wait while a watched call is in flight. True if there was one."""
+    if in_flight is None:
+        return False
+    waited = 0
+    while waited < limit_s:
+        try:
+            busy = in_flight()
+        except Exception:
+            busy = False
+        if not busy:
+            break
+        page.wait_for_timeout(1000)
+        waited += 1
+    return waited > 0
+
+
 def raise_if_stuck(page: Page, doing: str) -> None:
     """Turn a silent hang into the named diagnosis it actually is."""
     if not stuck_loading(page):
         return
+    # Loading with a call still on its way is the app waiting, not hung.
+    if wait_while_busy(page):
+        page.wait_for_timeout(1500)        # let it render what came back
+        if not stuck_loading(page):
+            return
     raise PageStuckLoading(
         f"The app is stuck on its 'Loading' screen while {doing}.\n"
         f"  Nothing rendered, and it will sit there indefinitely rather than "

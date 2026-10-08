@@ -60,7 +60,9 @@ def main() -> int:
 
             step("2/6", "Checking this is a staging environment ...")
             safety.verify_environment(page, cfg)
-            step("2/6", "Staging banner found - safe to continue.")
+            step("2/6", ("Staging banner found" if cfg.require_staging_banner else
+                         "Known test host, no live API calls")
+                 + " - safe to continue.")
 
             step("3/6", "Opening Vehicle Details ...")
             vehicle_page = VehicleDetailsPage(page).open(cfg.base_url)

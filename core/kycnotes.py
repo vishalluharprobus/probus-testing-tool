@@ -78,3 +78,89 @@ def is_reliably(insurer: str, style: str) -> bool:
 def never(insurer: str, style: str) -> bool:
     """Has this insurer never shown this shape? (Unknown counts as never.)"""
     return style not in _load().get(insurer.strip().upper(), {}).get("seen", {})
+
+
+# ------------------------------------------------------------ redirect trips
+#
+# A redirect insurer has more worth remembering than "it redirects": WHERE the
+# link goes, whether it opens in the same tab or a new one, the page it sends
+# the customer back to, and how each round-trip test ended. That is the
+# difference between "RELIANCE redirects" and something a developer can act on.
+
+def record_round_trip(insurer: str, mode: str, passed: bool, headline: str,
+                      facts: dict) -> None:
+    """Remember one redirect test. Never raises."""
+    try:
+        data = _load()
+        key = insurer.strip().upper()
+        entry = data.setdefault(key, {"seen": {}, "hosts": [], "last_seen": ""})
+        trip = entry.setdefault("redirect", {})
+        # Facts only overwrite with something. A run that died before the
+        # return must not erase the return path an earlier run learned.
+        for name, value in facts.items():
+            if value:
+                trip[name] = value
+        tests = trip.setdefault("tests", {})
+        tally = tests.setdefault(mode, {"pass": 0, "fail": 0, "last": ""})
+        tally["pass" if passed else "fail"] += 1
+        tally["last"] = f"{date.today().isoformat()} {headline[:140]}"
+
+        NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        NOTES_FILE.write_text(json.dumps(data, indent=2, sort_keys=True),
+                              encoding="utf-8")
+    except Exception:
+        pass
+
+
+def round_trip(insurer: str) -> dict:
+    """What we know about this insurer's redirect, or {}."""
+    return _load().get(insurer.strip().upper(), {}).get("redirect", {})
+
+
+def has_redirected(insurer: str) -> bool:
+    return not never(insurer, "redirect") or bool(round_trip(insurer))
+
+
+def redirect_share(insurer: str) -> float | None:
+    """
+    How often this insurer redirected when we drove it, or None if never driven.
+
+    "Has redirected" alone is not enough to choose by: NATIONAL redirected 3
+    times in 21, so picking it for a redirect test mostly produced inline runs
+    that tested nothing.
+    """
+    seen = _load().get(insurer.strip().upper(), {}).get("seen", {})
+    total = sum(seen.values())
+    return seen.get("redirect", 0) / total if total else None
+
+
+def report() -> str:
+    """Every insurer we have seen, as a table a person can read."""
+    data = _load()
+    if not data:
+        return "No KYC observations yet - run run_proposal_test.py first."
+    rows = [f"{'INSURER':<14}{'SEEN':<28}{'REDIRECT GOES TO':<30}{'OPENS IN':<10}"
+            f"RETURN TESTS"]
+    for insurer in sorted(data):
+        entry = data[insurer]
+        seen = ", ".join(f"{s} x{n}" for s, n in
+                         sorted(entry.get("seen", {}).items(), key=lambda kv: -kv[1]))
+        trip = entry.get("redirect", {})
+        goes = trip.get("link_host") or ", ".join(entry.get("hosts", [])) or "-"
+        tests = "; ".join(f"{mode}: {t['pass']} pass / {t['fail']} fail"
+                          for mode, t in sorted(trip.get("tests", {}).items())) or "-"
+        rows.append(f"{insurer:<14}{seen[:27]:<28}{goes[:29]:<30}"
+                    f"{trip.get('opens_in', '-'):<10}{tests}")
+        for mode, t in sorted(trip.get("tests", {}).items()):
+            rows.append(f"{'':<14}last {mode}: {t.get('last', '')}")
+    return "\n".join(rows)
+
+
+if __name__ == "__main__":
+    # python -m core.kycnotes   ->  "which insurers redirect, and where?"
+    import sys
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    print(report())

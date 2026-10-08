@@ -78,6 +78,8 @@ DESCRIBE_JS = r"""
       value: tag === 'mat-select' ? (el.innerText || '').trim() : (el.value || ''),
       required: cls.includes('ng-invalid') || el.required === true,
       invalid: cls.includes('ng-invalid'),
+      disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true'
+                || cls.includes('mat-mdc-select-disabled'),
     });
   }
   return out;
@@ -94,6 +96,7 @@ class Field:
     value: str
     required: bool
     invalid: bool
+    disabled: bool = False
 
     @property
     def haystack(self) -> str:
@@ -132,6 +135,12 @@ def autofill(page: Page, wanted: dict[str, str],
             continue          # already has a value - usually from KYC. Leave it.
         if field.kind in ("radio", "checkbox"):
             continue          # handled explicitly, never guessed
+        if field.disabled or _settled_since(page, field):
+            # Locked or already answered by the app. On the proposal, choosing
+            # the salutation "Mr" makes the app set Gender to Male and lock it -
+            # AFTER the form was read - so the field is looked at again right
+            # before touching it. Clicking it anyway waited out 6 seconds.
+            continue
 
         value = _match(field, wanted)
         if value is None:
@@ -159,6 +168,35 @@ def autofill(page: Page, wanted: dict[str, str],
                 f"{field.name or field.label} (tried '{tried}' - {reason})")
 
     return filled, unmatched
+
+
+def _settled_since(page: Page, field: Field) -> bool:
+    """
+    Has the app locked or filled this control since the form was read?
+
+    Forms here cascade - one answer sets another - so the snapshot taken at
+    the start of a pass goes stale while the pass runs. Only named controls
+    can be looked up again; anything else is judged by the snapshot.
+    """
+    if not field.name:
+        return False
+    tag = "mat-select" if field.kind == "select" else "input"
+    try:
+        box = page.locator(f'{tag}[formcontrolname="{field.name}"]').first
+        if (box.get_attribute("aria-disabled", timeout=1000) == "true"
+                or box.is_disabled(timeout=1000)):
+            return True
+        classes = box.get_attribute("class", timeout=1000) or ""
+        if field.kind == "select":
+            text = (box.inner_text(timeout=1000) or "").strip()
+            return (bool(text) and not text.lower().startswith("select")
+                    and "ng-invalid" not in classes)
+        # A text box the app filled in the meantime - never overwrite that.
+        return (not field.value.strip()
+                and bool(box.input_value(timeout=1000).strip())
+                and "ng-invalid" not in classes)
+    except Exception:
+        return False
 
 
 def _match(field: Field, wanted: dict[str, str]) -> str | None:

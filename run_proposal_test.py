@@ -4,6 +4,11 @@ Drive one insurer all the way to the KYC / proposal stage.
     python run_proposal_test.py --insurer ZUNO
     python run_proposal_test.py --insurer ZUNO --submit-kyc     # calls the insurer
 
+    PRIVATE CAR - the same journey on the car screens (/private-car/...),
+    with the Maruti Swift the insurer lab proved:
+    python run_proposal_test.py --product car --insurer AUTO
+    python run_proposal_test.py --product car --insurer AUTO --proposal
+
 THIS GOES FURTHER THAN run_quote_test.py
 ----------------------------------------
 run_quote_test.py stops at the quote list and creates nothing anywhere. This
@@ -13,6 +18,16 @@ raised to "proposal" in config/settings.local.json.
 By default it still stops short of submitting: it fills the KYC form and
 reports whether the app accepts it, WITHOUT pressing Proceed. Add --submit-kyc
 to actually submit, which calls the insurer's KYC service for real.
+
+WHEN THE INSURER DOES KYC ON ITS OWN SITE (redirect KYC - SBI, NATIONAL...)
+    --kyc-redirect stop      check the handover out to the insurer, then stop
+    --kyc-redirect abandon   give up there, go back to our KYC screen; the
+                             portal must NOT let that customer through
+    --kyc-redirect assist    a person finishes KYC on the insurer's site; the
+                             tool checks the way back and carries on
+    python tests/rehearse_kyc_redirect.py   the same checks against a fake
+                                            insurer, in about two minutes
+    python -m core.kycnotes                 which insurers redirect, and where
 """
 from __future__ import annotations
 
@@ -27,17 +42,34 @@ from urllib.parse import urlparse
 from config import insurers, settings
 from config.insurers import profile_for
 from data.customer import DEFAULT as CUSTOMER
-from core import (auth, backend, browser, console, health, kycnotes,
-                  safety, ui)
+from data.labscenarios import PRODUCTS
+from core import (addressnotes, auth, backend, browser, console, health,
+                  kycnotes, safety, ui, vehiclecatalog)
 from pages.additional_details import AdditionalChoice, AdditionalDetailsPage
 from pages.kyc import KycPage
+from pages.kyc_redirect import KycRedirect, short_url
 from pages.policy_details import PolicyChoice, PolicyDetailsPage
 from pages.proposal import ProposalPage
 from pages.quote_list import QuoteListPage
+from pages import routes
 from pages.vehicle_details import Vehicle, VehicleDetailsPage
 
 HONDA_ACTIVA = Vehicle("GJ-01", "GJ-01 Ahmedabad", "HONDA", "ACTIVA",
                        "3G (110 CC) (PETROL)", "2022")
+
+# What each product's journey drives. The car is three years old: the oldest
+# age for which every car policy type really works (a 4-year-old car's OD
+# Only gets stuck on screen 3 - see data/matrix.py).
+VEHICLES = {"bike": HONDA_ACTIVA, "car": vehiclecatalog.PROVEN_CAR}
+
+# What --kyc-redirect does if the insurer sends the browser to its own site.
+REDIRECT_MODES = {
+    "stop": "if the insurer redirects, check the handover and stop there",
+    "assist": "if the insurer redirects, YOU finish KYC on its site; "
+              "the tool fills what it can, waits, then checks the way back",
+    "abandon": "if the insurer redirects, give up there and go back to our "
+               "KYC screen (the portal must not let that customer through)",
+}
 
 
 def main() -> int:
@@ -45,8 +77,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--insurer", default="ZUNO",
                     help="insurer code, or AUTO to drive whichever insurer "
-                         "quoted and is least likely to redirect")
+                         "quoted and is least likely to redirect (with "
+                         "--kyc-redirect assist/abandon: MOST likely)")
     ap.add_argument("--target", default=settings.DEFAULT_TARGET)
+    ap.add_argument("--product", choices=tuple(PRODUCTS), default="bike",
+                    help="bike = two-wheeler (default), car = private car")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--slow", type=int, default=0)
     ap.add_argument("--addons", default="")
@@ -55,11 +90,32 @@ def main() -> int:
     ap.add_argument("--proposal", action="store_true",
                     help="after KYC, fill the proposal up to Preview "
                          "(implies --submit-kyc)")
+    ap.add_argument("--kyc-redirect", choices=tuple(REDIRECT_MODES),
+                    default=None,
+                    help="what to do when the insurer sends the browser to its "
+                         "OWN KYC site. stop: prove the handover works, then "
+                         "stop (automatic). assist: YOU finish KYC there (OTP "
+                         "etc.) while the tool fills what it can and waits, "
+                         "then it checks the way back and carries on. abandon: "
+                         "give up on the insurer's page and go back to our KYC "
+                         "screen - the portal must not let that customer through")
+    ap.add_argument("--kyc-wait", type=int, default=10, metavar="MINUTES",
+                    help="how long --kyc-redirect assist waits for you "
+                         "(default 10)")
     ap.add_argument("--retries", type=int, default=2,
                     help="how many times to retry when the ENVIRONMENT fails "
                          "(app stuck loading, master data empty). Real test "
                          "failures are never retried.")
     args = ap.parse_args()
+    # Asking for ANY redirect mode by name - even "stop" - means "test the
+    # redirect", and most insurers only redirect once Proceed is pressed. So
+    # it implies --submit-kyc; a redirect test that never submits has nothing
+    # to look at. Decided once here, not per attempt, so a retry cannot
+    # mistake the filled-in default for an explicit choice.
+    args.redirect_test = args.kyc_redirect is not None
+    if args.redirect_test:
+        args.submit_kyc = True
+    args.kyc_redirect = args.kyc_redirect or "stop"
     return run_with_retries(args)
 
 
@@ -138,9 +194,13 @@ def hidden_error(body: str) -> str:
     return "; ".join(dict.fromkeys(found))[:300]
 
 
-def pick_best(quotes):
+def pick_best(quotes, want_redirect: bool = False):
     """
     Choose which insurer to drive when --insurer AUTO is used.
+
+    With want_redirect (a --kyc-redirect assist/return run) the order turns
+    over: the point of that run IS the redirect, so insurers that have
+    redirected before come first, and one that never does is the last resort.
 
     Naming one insurer is the single biggest reason a run produces nothing: the
     panel is different every time, and a run that demands IFFCOTOKIO simply
@@ -159,10 +219,31 @@ def pick_best(quotes):
     """
     ranked = []
     for quote in quotes:
-        expected = profile_for(quote.insurer).kyc_style
-        redirects = (expected == insurers.REDIRECT
-                     or not kycnotes.never(quote.insurer, insurers.REDIRECT))
-        if redirects:
+        profile = profile_for(quote.insurer)
+        redirects = (profile.kyc_style == insurers.REDIRECT
+                     or kycnotes.has_redirected(quote.insurer))
+        if want_redirect:
+            # By how OFTEN it redirects, not whether it ever has. NATIONAL
+            # redirected 3 times in 21 and kept being picked, so redirect
+            # runs kept verifying inline and testing nothing.
+            share = kycnotes.redirect_share(quote.insurer)   # None = never driven
+            configured = profile.kyc_style == insurers.REDIRECT
+            if (share or 0) >= 0.5 or (configured and share is None):
+                rank = 0        # redirects most of the time, or is set up to
+            elif share:
+                rank = 1        # has redirected, but usually verifies inline
+            elif share is None:
+                rank = 2        # never driven - may redirect
+            else:
+                rank = 3        # driven, never redirected
+        elif redirects:
+            rank = 3
+        elif profile.known_blocker or addressnotes.looks_hopeless(quote.insurer):
+            # Driveable, but we already know where it stops - and it is a
+            # product defect we cannot fix from here. Worth trying only when
+            # nothing better quoted, which is exactly what happened: AUTO
+            # picked NATIONAL as "not tried before" and spent three minutes
+            # walking into a wall this file already described.
             rank = 2
         elif kycnotes.summary(quote.insurer):
             rank = 0
@@ -174,19 +255,250 @@ def pick_best(quotes):
     return ranked[0] if ranked else None
 
 
+def home_hosts(cfg) -> set[str]:
+    """The hosts that are US on this target - the app, and the API behind it."""
+    return {urlparse(url).hostname or "" for url in (cfg.base_url, cfg.api_url)
+            if url} - {""}
+
+
+def fill_and_submit_kyc(kyc, page, target, cfg, args, run_dir,
+                        redirect_announced) -> int | None:
+    """
+    The inline KYC form: fill it, submit it, and see what the insurer does.
+
+    Returns an exit code to end the run, or None to carry on. A redirect that
+    happens on submit is not handled here - the caller tests that round trip.
+    """
+    kyc.wait_until_loaded()
+    print("  KYC form reached")
+
+    kyc.fill_details(CUSTOMER)
+    ready = kyc.can_proceed()
+    print(f"  KYC details filled - form is "
+          f"{'complete' if ready else 'INCOMPLETE'}")
+    if not ready:
+        # Say WHICH field, not just "incomplete" - the app already knows.
+        reported = kyc.missing_required()
+        for field in reported:
+            print(f"      still needed: {field}")
+        # If no visible field looks wrong, the blocker is something
+        # missing_required cannot see - a hidden tickbox, an unchosen
+        # radio group, or simply a request still in flight. Printing
+        # nothing at all here is what made the last run unexplainable.
+        blocked = kyc.why_blocked()
+        if blocked:
+            print("      why the Proceed button is dead:")
+            for line in blocked:
+                print(f"        - {line}")
+        elif not reported:
+            print("      nothing on the form looks wrong - see the "
+                  "screenshot; this may be a timing problem")
+
+    if not args.submit_kyc:
+        print("\n  STOPPING HERE. Filled but not submitted.")
+        print("  Re-run with --submit-kyc to call the insurer for real.")
+        return 0 if ready else 1
+    if not ready:
+        print("\n  Refusing to submit an incomplete form.")
+        # A picture of the blocked form is worth more than the field
+        # list when the field list is the thing that came up empty.
+        print(f"  Screenshot: "
+              f"{browser.capture_failure(page, run_dir, 'kyc-blocked')}")
+        return 1
+
+    kyc.proceed()
+    # The KYC call can answer in two ways - the upload step appears, or
+    # we go straight to the proposal. Waiting for EITHER is faster than
+    # sleeping long enough to cover both.
+    kyc.wait_for_kyc_response()
+    print(f"  KYC submitted, now on: {page.url}")
+
+    # Clear the response dialog BEFORE asking what the screen shows.
+    # The order matters: NATIONAL answers with a "KYC verification
+    # success." popup that covers the whole step, so asking first
+    # answered "no documents wanted" while the upload step was sitting
+    # underneath it, and the run then waited for a proposal page that
+    # was never going to arrive.
+    message = kyc.settle()
+    if message:
+        print(f"  KYC result: {message}")
+
+    # Not every insurer asks for documents - ZUNO does, others verify
+    # from the PAN alone and go straight on to the proposal.
+    # Already on the proposal means no documents were wanted - asking
+    # anyway waited 20 seconds for a screen that could not appear. The
+    # same goes for a browser that is already on the insurer's own site.
+    if (not kyc.redirected_to
+            and not routes.on(page.url, "proposal")
+            and kyc.upload_step_showing()):
+        print("  document upload requested - attaching files")
+        kyc.upload_documents(CUSTOMER, cfg.test_documents_dir)
+        result = kyc.finish()
+        print(f"  uploaded: {', '.join(kyc.uploaded) or 'nothing'}")
+        for note in kyc.notes:
+            print(f"  NOTE: {note}")
+        print(f"  KYC result: {result or message or '(no message shown)'}")
+    elif not message:
+        print("  no document upload for this insurer - verified from PAN")
+
+    # NOW we know what this insurer really does, because it has done it:
+    # handed us to another site, asked for documents, or verified from
+    # the PAN alone. This is the answer to "which insurers redirect?",
+    # and it is evidence rather than expectation. A redirect the server
+    # announced counts even if the browser failed to follow it - that is
+    # still the shape the insurer chose.
+    observed = (insurers.REDIRECT if kyc.redirected_to or redirect_announced
+                else insurers.DOCUMENTS if kyc.uploaded
+                else insurers.INLINE)
+    kycnotes.record(target.insurer, observed, kyc.redirected_to)
+    print(f"  KYC shape confirmed: {observed}")
+    return None
+
+
+def print_checks(redirect: KycRedirect, start: int = 0) -> int:
+    """Print the round-trip checks from `start` on, grouped by leg."""
+    leg = ""
+    for check in redirect.checks[start:]:
+        if check.leg != leg:
+            leg = check.leg
+            print(f"\n  leg {leg}")
+        print(f"    {check.line()}")
+    return len(redirect.checks)
+
+
+def follow_redirect(redirect: KycRedirect, kyc: KycPage, target, args,
+                    run_dir, home_url: str = ""):
+    """
+    Test the KYC round trip: out to the insurer's own site, and back again.
+
+    Returns (exit_code, None) to end the run, or (None, tab) to carry on into
+    the proposal in the tab the customer came back in. That is a NEW tab
+    whenever the insurer opened in one, which is why the caller must switch.
+    """
+    mode = args.kyc_redirect
+    tab = redirect.wait_for_departure(timeout_ms=8000) or kyc.redirect_tab
+    profile = profile_for(target.insurer)
+    redirect.check_handover(tab, profile.kyc_hosts)
+    h = redirect.handover
+    went = (redirect.summary()["link_host"] or kyc.redirected_to
+            or h.insurer_host or "(nowhere)")
+
+    print(f"\n{'=' * 62}")
+    print("KYC CONTINUES ON THE INSURER'S OWN SITE")
+    print("=" * 62)
+    print(f"\n  {target.insurer} could not verify the customer from the central KYC")
+    print("  registry, so it sends them to its own KYC page. That page must send")
+    print("  them back to us afterwards.")
+    print(f"\n  insurer page : {went}"
+          + (f"   (opened in the {redirect.opened_in})" if redirect.opened_in else ""))
+    launch = h.launch_link or redirect.launch_seen
+    if launch:
+        print(f"  launched by  : {short_url(launch)}")
+    if h.ckyc_status:
+        print(f"  CKYC search  : {h.ckyc_status}")
+
+    if tab is not None:
+        redirect.inspect_insurer_page(tab)
+        print(f"  screenshot   : "
+              f"{browser.capture(tab, run_dir, 'kyc-1-insurer-page')}")
+    shown = print_checks(redirect)
+
+    if mode == "stop" or tab is None:
+        passed = tab is not None and not redirect.failed
+        kycnotes.record_round_trip(target.insurer, "handover", passed,
+                                   "handover OK" if passed else
+                                   "; ".join(c.name for c in redirect.failed),
+                                   redirect.summary())
+        if tab is None:
+            print("\n  RESULT: FAIL - the customer would be stuck on our KYC screen.")
+            return 1, None
+        print(f"\n  RESULT: {'PASS' if passed else 'FAIL'} - the handover "
+              f"{'works' if passed else 'has problems, see above'}.")
+        print("  Stopped at the insurer's page (--kyc-redirect stop). To test "
+              "the rest:")
+        car = " --product car" if args.product == "car" else ""
+        print(f"    python run_proposal_test.py{car} --insurer {target.insurer} "
+              f"--kyc-redirect abandon")
+        print(f"    python run_proposal_test.py{car} --insurer {target.insurer} "
+              f"--kyc-redirect assist --proposal")
+        if went != "(nowhere)" and went not in profile.kyc_hosts:
+            print(f"\n  Worth recording in config/insurers.py for {target.insurer}:")
+            print(f'      kyc_style=REDIRECT, kyc_hosts=("{went}",)')
+        return (0 if passed else 1), None
+
+    if mode == "abandon":
+        print("\n  TEST: the customer gives up on the insurer's page and goes back")
+        print("  to our KYC screen. Nobody did KYC, so the portal must NOT let them")
+        print("  into the proposal. Nothing is typed or clicked on the insurer's page.")
+        landing = redirect.abandon(
+            f"{home_url.rstrip('/')}/{PRODUCTS[args.product].page}/kyc-insurance")
+    else:
+        tab.bring_to_front()
+        filled = redirect.prefill(tab, CUSTOMER)
+        print("\n  " + "-" * 58)
+        print("  YOUR TURN - look at the browser window")
+        print("  " + "-" * 58)
+        print(f"  1. {target.insurer}'s KYC page is open. The tool typed in:")
+        for line in filled or ["(nothing it could safely recognise)"]:
+            print(f"       {line}")
+        print("  2. Check those, then finish it yourself: type the OTP, tick the")
+        print("     consent, take the selfie - whatever the page asks.")
+        print("  3. Do NOT close the browser. When the insurer sends you back to")
+        print("     our portal, the tool notices by itself and carries on.")
+        print(f"  Waiting up to {args.kyc_wait} minute{'s' if args.kyc_wait != 1 else ''} "
+              f"(change with --kyc-wait) ...")
+        landing = redirect.assist(tab, CUSTOMER, args.kyc_wait)
+
+    verdict = redirect.check_landing(landing, mode)
+    print_checks(redirect, shown)
+    if landing.tab is not None and not landing.tab.is_closed():
+        print(f"\n  screenshot   : "
+              f"{browser.capture(landing.tab, run_dir, 'kyc-2-after')}")
+    word = {0: "PASS", 1: "FAIL"}.get(verdict.code, "STOPPED")
+    print(f"\n  RESULT: {word} - {verdict.headline}")
+    for line in verdict.advice:
+        print(f"    {line}")
+    kycnotes.record_round_trip(target.insurer, mode, verdict.code == 0,
+                               verdict.headline, redirect.summary())
+
+    if verdict.code != 0:
+        return verdict.code, None
+    if mode == "abandon":
+        # The negative test passed. The journey cannot go on, because KYC
+        # was deliberately never done.
+        print("\n  (The journey stops here on purpose - KYC was never done.)")
+        return 0, None
+    if not landing.resumable:
+        print(f"\n  Back on {short_url(landing.url)}, which is not the proposal "
+              f"page this tool drives - stopping here.")
+        return 0, None
+    landing.tab.bring_to_front()
+    return None, landing.tab
+
+
 def attempt(args) -> int:
     cfg = settings.load(args.target)
     addons = [a.strip() for a in args.addons.split(",") if a.strip()]
     # Filling the proposal is pointless unless KYC actually ran, so asking
     # for one implies the other rather than failing later with an empty form.
-    if args.proposal:
+    # Most insurers only redirect once the KYC form is SUBMITTED (RELIANCE,
+    # NATIONAL), so a redirect test that never presses Proceed has nothing
+    # to test.
+    if args.proposal or args.kyc_redirect != "stop":
         args.submit_kyc = True
 
+    vehicle = VEHICLES[args.product]
     print(f"\nTarget  : {cfg.name} ({cfg.base_url})")
+    print(f"Product : {PRODUCTS[args.product].title}")
     print(f"Insurer : {args.insurer}")
-    print(f"Vehicle : {HONDA_ACTIVA.make} {HONDA_ACTIVA.model}, {HONDA_ACTIVA.rto}")
+    print(f"Vehicle : {vehicle.make} {vehicle.model} {vehicle.variant}, "
+          f"{vehicle.registration_year}, {vehicle.rto}")
     print(f"KYC     : {'WILL BE SUBMITTED' if args.submit_kyc else 'filled but not submitted'}")
-    print(f"Proposal: {'filled up to Preview' if args.proposal else 'not entered'}")
+    print(f"Redirect: {REDIRECT_MODES[args.kyc_redirect]}")
+    goes_on = ("up to the payment page (OTP typed, Proceed pressed)"
+               if safety.permits("payment", cfg)
+               else "filled up to Preview, OTP typed")
+    print(f"Proposal: {goes_on if args.proposal else 'not entered'}")
     print(f"Ceiling : {cfg.write_ceiling}\n")
 
     # Ask the API whether it is awake before spending 90 seconds finding out
@@ -204,6 +516,7 @@ def attempt(args) -> int:
     with browser.browser_session(cfg, headed=not args.headless,
                                  slow_mo_ms=args.slow) as (context, run_dir):
         page = None
+        proposal = None
         watcher = health.Watcher.for_context(context)
 
         # Every API call the app makes, in order. The health watcher records
@@ -272,7 +585,8 @@ def attempt(args) -> int:
 
             # --- the safe part, identical to run_quote_test -------------------
             safety.allow("quote", cfg)
-            VehicleDetailsPage(page).open(cfg.base_url).fill(HONDA_ACTIVA).proceed()
+            VehicleDetailsPage(page).open(cfg.base_url, args.product).fill(
+                vehicle).proceed()
             PolicyDetailsPage(page).wait_until_loaded().fill(
                 PolicyChoice()).proceed()
             AdditionalDetailsPage(page).wait_until_loaded().fill(
@@ -293,17 +607,43 @@ def attempt(args) -> int:
                 # fan-out, which is the point: we want the choice, not the
                 # first answer.
                 quote_page.wait_until_loaded()
-                best = pick_best(quote_page.quotes())
+                want_redirect = getattr(args, "redirect_test", False)
+                best = pick_best(quote_page.quotes(), want_redirect)
                 target = best[2] if best else None
                 if target is not None:
-                    why = {0: "driven before, never redirected",
-                           1: "not tried before",
-                           2: "redirects - nothing better on offer"}[best[0]]
+                    why = ({0: "redirects most of the time, or is set up to",
+                            1: "has redirected, but usually verifies inline",
+                            2: "not tried before - may redirect",
+                            3: "never redirected - nothing better quoted"}
+                           if want_redirect else
+                           {0: "driven before, never redirected",
+                            1: "not tried before",
+                            2: "KNOWN BLOCKER - nothing better quoted",
+                            3: "redirects - nothing better on offer"})[best[0]]
                     print(f"  auto-picked {target.insurer} ({why})")
+                    # Say it plainly, up front. Finding out at the end that the
+                    # wall was already documented wastes the run AND makes a
+                    # known defect look like a new failure.
+                    blocker = profile_for(target.insurer).known_blocker
+                    if blocker:
+                        print(f"  HEADS UP: {target.insurer} {blocker}.")
+                        print(f"  Expect this run to stop there. It is a product "
+                              f"defect, already recorded in config/insurers.py.")
             else:
                 # Otherwise stop as soon as OUR insurer prices - no point waiting
                 # out the rest of the fan-out for cards we will ignore.
                 target = quote_page.wait_for_insurer(args.insurer)
+
+            # What the address notes already know, said up front - whichever
+            # way the insurer was chosen - so a known wall is never a surprise.
+            if target is not None and addressnotes.looks_hopeless(target.insurer):
+                print(f"  HEADS UP: {target.insurer} has refused every city tried "
+                      f"({addressnotes.summary(target.insurer)}).")
+                print("  That is missing data on the server, not a test problem. "
+                      "This run keeps the customer's own address and stops at the "
+                      "first refusal - in seconds - with the details for the "
+                      "backend team. The moment they fix it, this address passes "
+                      "and the tool learns that on its own.")
 
             found = quote_page.quotes()
             print(f"  {len(found)} quotes: "
@@ -331,6 +671,11 @@ def attempt(args) -> int:
 
             # --- past here we are changing state ------------------------------
             safety.allow("proposal", cfg)
+
+            # Listening BEFORE Buy Now: the server announces a KYC redirect in
+            # an API answer during the KYC submit, and a listener attached
+            # afterwards never hears it.
+            redirect = KycRedirect(context, page, home_hosts(cfg))
 
             print(f"\n  buying {target.insurer} at Rs {target.premium:,} ...")
             quote_page.buy(target.insurer)
@@ -377,130 +722,39 @@ def attempt(args) -> int:
                       f"to config/insurers.py)")
 
             if style == insurers.REDIRECT:
-                print(f"\n{'=' * 62}")
-                print("KYC HAPPENS ON THE INSURER'S OWN PORTAL")
-                print("=" * 62)
-                print(f"\n  The browser was sent to: {detail}")
-                print("\n  This insurer does not do KYC on our portal - the customer")
-                print("  completes it on the insurer's website and is sent back.")
-                print("  That is somebody else's UI, unmapped and liable to change,")
-                print("  so the harness stops here rather than pretending to drive it.")
-                print("\n  What this run DID prove: quote -> Buy Now -> Confirm works,")
-                print("  and the handover to the insurer fires correctly.")
-                print(f"\n  Add this to config/insurers.py:")
-                print(f"      kyc_hosts=(\"{detail}\",)")
-                return 0
-
-            if style == insurers.SKIPPED:
+                # Sent away before the form. Test the round trip; a customer
+                # who comes back verified carries on into the proposal below,
+                # in whichever tab they came back in.
+                code, page = follow_redirect(redirect, kyc, target, args, run_dir,
+                                             cfg.base_url)
+                if code is not None:
+                    return code
+            elif style == insurers.SKIPPED:
                 print("  no KYC asked for - went straight to the proposal")
                 print(f"  now on: {page.url}")
                 return 0
-
-            if style == insurers.UNKNOWN:
+            elif style == insurers.UNKNOWN:
                 print(f"  could not tell what KYC shape this is. Now on: {detail}")
                 return 1
+            else:
+                code = fill_and_submit_kyc(kyc, page, target, cfg, args, run_dir,
+                                           redirect.expected)
+                if code is not None:
+                    return code
+                print(f"  now on: {page.url}")
+                safety.assert_never_pays(page)
 
-            kyc.wait_until_loaded()
-            print("  KYC form reached")
-
-            kyc.fill_details(CUSTOMER)
-            ready = kyc.can_proceed()
-            print(f"  KYC details filled - form is "
-                  f"{'complete' if ready else 'INCOMPLETE'}")
-            if not ready:
-                # Say WHICH field, not just "incomplete" - the app already knows.
-                reported = kyc.missing_required()
-                for field in reported:
-                    print(f"      still needed: {field}")
-                # If no visible field looks wrong, the blocker is something
-                # missing_required cannot see - a hidden tickbox, an unchosen
-                # radio group, or simply a request still in flight. Printing
-                # nothing at all here is what made the last run unexplainable.
-                blocked = kyc.why_blocked()
-                if blocked:
-                    print("      why the Proceed button is dead:")
-                    for line in blocked:
-                        print(f"        - {line}")
-                elif not reported:
-                    print("      nothing on the form looks wrong - see the "
-                          "screenshot; this may be a timing problem")
-
-            if not args.submit_kyc:
-                print("\n  STOPPING HERE. Filled but not submitted.")
-                print("  Re-run with --submit-kyc to call the insurer for real.")
-                return 0 if ready else 1
-            if not ready:
-                print("\n  Refusing to submit an incomplete form.")
-                # A picture of the blocked form is worth more than the field
-                # list when the field list is the thing that came up empty.
-                print(f"  Screenshot: "
-                      f"{browser.capture_failure(page, run_dir, 'kyc-blocked')}")
-                return 1
-
-            kyc.proceed()
-            # The KYC call can answer in two ways - the upload step appears, or
-            # we go straight to the proposal. Waiting for EITHER is faster than
-            # sleeping long enough to cover both.
-            kyc.wait_for_kyc_response()
-            print(f"  KYC submitted, now on: {page.url}")
-
-            # Clear the response dialog BEFORE asking what the screen shows.
-            # The order matters: NATIONAL answers with a "KYC verification
-            # success." popup that covers the whole step, so asking first
-            # answered "no documents wanted" while the upload step was sitting
-            # underneath it, and the run then waited for a proposal page that
-            # was never going to arrive.
-            message = kyc.settle()
-            if message:
-                print(f"  KYC result: {message}")
-
-            # Not every insurer asks for documents - ZUNO does, others verify
-            # from the PAN alone and go straight on to the proposal.
-            if kyc.upload_step_showing():
-                print("  document upload requested - attaching files")
-                kyc.upload_documents(CUSTOMER, cfg.test_documents_dir)
-                result = kyc.finish()
-                print(f"  uploaded: {', '.join(kyc.uploaded) or 'nothing'}")
-                for note in kyc.notes:
-                    print(f"  NOTE: {note}")
-                print(f"  KYC result: {result or message or '(no message shown)'}")
-            elif not message:
-                print("  no document upload for this insurer - verified from PAN")
-
-            # NOW we know what this insurer really does, because it has done it:
-            # handed us to another site, asked for documents, or verified from
-            # the PAN alone. This is the answer to "which insurers redirect?",
-            # and it is evidence rather than expectation.
-            observed = (insurers.REDIRECT if kyc.redirected_to
-                        else insurers.DOCUMENTS if kyc.uploaded
-                        else insurers.INLINE)
-            kycnotes.record(target.insurer, observed, kyc.redirected_to)
-            print(f"  KYC shape confirmed: {observed}")
-
-            print(f"  now on: {page.url}")
-            safety.assert_never_pays(page)
-
-            # Some insurers look inline and only redirect AFTER the form is
-            # submitted, so this is checked here as well as up front.
-            if kyc.redirected_to:
-                kycnotes.record(target.insurer, insurers.REDIRECT,
-                                kyc.redirected_to)
-                print(f"\n{'=' * 62}")
-                print("KYC CONTINUES ON AN EXTERNAL PORTAL")
-                print("=" * 62)
-                print(f"\n  After submitting, the browser was sent to:")
-                print(f"    {kyc.redirected_to}")
-                print(f"\n  So {target.insurer} does NOT finish KYC on our portal - it")
-                print("  hands the customer to an external site and expects them back.")
-                print("  That site is not ours, is unmapped, and usually has its own")
-                print("  OTP, so the harness stops rather than pretending to drive it.")
-                print(f"\n  Proven by this run: quote -> Buy Now -> Confirm -> KYC form")
-                print(f"  -> submission -> handover all work for {target.insurer}.")
-                print(f"\n  Record it in config/insurers.py:")
-                print(f'      "{target.insurer}": InsurerProfile(')
-                print(f'          code="{target.insurer}", kyc_style=REDIRECT,')
-                print(f'          kyc_hosts=("{kyc.redirected_to}",)),')
-                return 0
+                # Some insurers look inline and only redirect AFTER the form
+                # is submitted (RELIANCE, NATIONAL), so this is checked here
+                # as well as up front. The server can also announce a redirect
+                # the browser never follows - a customer left stranded on the
+                # KYC screen - and that deserves the same test, where it fails.
+                if kyc.redirected_to or (redirect.expected
+                                         and not routes.on(page.url, "proposal")):
+                    code, page = follow_redirect(redirect, kyc, target, args,
+                                                 run_dir, cfg.base_url)
+                    if code is not None:
+                        return code
 
             if not args.proposal:
                 print("\n  KYC done. Re-run with --proposal to continue into the "
@@ -509,6 +763,9 @@ def attempt(args) -> int:
 
             # ---- the proposal itself -----------------------------------------
             proposal = ProposalPage(page).wait_until_loaded()
+            # Share the buried-error list, so each step stops waiting the moment
+            # the app answers "no" instead of sitting out its timeout.
+            proposal.hidden_errors = hidden_errors
             print(f"\n  proposal reached - {proposal.current_step()}")
 
             # What KYC already gave us. This is the evidence that KYC worked, so
@@ -521,7 +778,9 @@ def attempt(args) -> int:
             if address:
                 print("  app derived from pincode: " +
                       ", ".join(f"{k}={v}" for k, v in address.items()))
-            proposal.fill_owner_details(CUSTOMER)
+            proposal.fill_owner_details(CUSTOMER, target.insurer)
+            for line in proposal.address_log:
+                print(f"      address: {line}")
             for item in proposal.filled:
                 print(f"      filled {item}")
             missing = proposal.missing_required()
@@ -534,7 +793,7 @@ def attempt(args) -> int:
             print(f"  -> {proposal.current_step()} "
                   f"(clicked {proposal.advanced_by!r})")
 
-            proposal.fill_vehicle_details(HONDA_ACTIVA.rto)
+            proposal.fill_vehicle_details(vehicle.rto, target.insurer)
             for item in proposal.filled:
                 print(f"      filled {item}")
             missing = proposal.missing_required()
@@ -542,7 +801,12 @@ def attempt(args) -> int:
                 print(f"  vehicle details incomplete: {', '.join(missing)}")
                 return 1
 
-            proposal.continue_to_terms()
+            # The app checks the registration number against RTO records here.
+            # A rejected number is swapped for another and tried again - see
+            # ProposalPage.continue_to_terms - and every answer is remembered.
+            proposal.continue_to_terms(target.insurer, vehicle.rto)
+            for line in proposal.vehicle_log:
+                print(f"      vehicle number: {line}")
             print(f"  -> {proposal.current_step()} "
                   f"(clicked {proposal.advanced_by!r})")
 
@@ -557,14 +821,50 @@ def attempt(args) -> int:
                 return 1
             print("  nominee and previous-policy details complete")
 
-            proposal.continue_to_preview()
+            # Given the customer and insurer, a "No district found" refusal
+            # sends it back to change the pincode instead of re-clicking.
+            logged = len(proposal.address_log)
+            try:
+                proposal.continue_to_preview(CUSTOMER, target.insurer,
+                                             vehicle.rto)
+            finally:
+                for line in proposal.address_log[logged:]:
+                    print(f"      address: {line}")
             print(f"  -> {proposal.current_step()} "
                   f"(clicked {proposal.advanced_by!r})")
 
-            # Preview is the end of the line. Payment is the next screen and
-            # nothing here clicks toward it.
+            # The consent OTP. The developer environment accepts a fixed OTP
+            # for any mobile, so it is typed in.
+            proposal.enter_otp(settings.DEV_OTP)
+            for line in proposal.otp_log:
+                print(f"      otp: {line}")
+
+            # Proceed sends the proposal to the insurer and opens payment, so
+            # it needs the "payment" ceiling. Below that, stop here - on
+            # purpose, and saying so, rather than refusing as if it failed.
+            if not safety.permits("payment", cfg):
+                safety.assert_never_pays(page)
+                print(f"\n  JOURNEY COMPLETE - OTP entered, stopped before "
+                      f"Proceed.")
+                print(f"  To press Proceed as well, set write_ceiling to "
+                      f"\"payment\" in config/settings.local.json.")
+                return 0
+
+            # A refusal is raised with the portal's reason, and the handler
+            # below prints the whole OTP log with it.
+            logged = len(proposal.otp_log)
+            landed = proposal.proceed_to_payment(settings.DEV_OTP)
+            for line in proposal.otp_log[logged:]:
+                print(f"      otp: {line}")
+
+            # The payment page is the end of the line: nothing on it is
+            # clicked, and paying stays a human's job.
             safety.assert_never_pays(page)
-            print(f"\n  JOURNEY COMPLETE - stopped at Preview, before payment.")
+            print(f"\n  JOURNEY COMPLETE - reached the payment page. "
+                  f"Nothing was paid.")
+            print(f"  payment page: {landed}")
+            print(f"  screenshot  : "
+                  f"{browser.capture(page, run_dir, 'payment-page')}")
             print(f"  now on: {page.url}")
             return 0
 
@@ -583,8 +883,27 @@ def attempt(args) -> int:
         except auth.LoginFailed as exc:
             print(f"\nLOGIN FAILED (setup problem):\n  {exc}\n")
             return 4
+        except auth.SessionRejected as exc:
+            print(f"\nTHE APP LOGGED US OUT MID-JOURNEY - an environment problem\n\n"
+                  f"  {exc}\n")
+            print("  The next attempt logs in afresh instead of reusing the saved "
+                  "session.\n")
+            auth.forget_saved_session()
+            return 6
         except LookupError as exc:
             print(f"\n{exc}\n")
+            # What the harness changed on its own, so a stop is never silent
+            # about the plates it tried.
+            if proposal is not None and proposal.vehicle_log:
+                print("  Vehicle numbers tried:")
+                for line in proposal.vehicle_log:
+                    print(f"    {line}")
+                print()
+            if proposal is not None and proposal.otp_log:
+                print("  OTP step:")
+                for line in proposal.otp_log:
+                    print(f"    {line}")
+                print()
             # Print this FIRST. When the app was told why and showed the user
             # nothing, that message IS the answer; everything else printed by
             # this handler is only context for it.

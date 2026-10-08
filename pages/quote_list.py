@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 
 from playwright.sync_api import Page
 
+from core import auth
+from pages import routes
+
 # Money as the portal writes it: an optional rupee sign, then digits with commas.
 MONEY = re.compile(r"₹\s*([\d,]+)")
 
@@ -112,13 +115,34 @@ FAILURE_KINDS = (
      "so it cannot also be the new one. Not a bug."),
     ("core service", "our-defect",
      "InsureBridge's own core service errored. Ours to investigate."),
+    # Before "getcalculatedpremium": UNITED wraps this one in that prefix, and
+    # the more specific meaning should win (first match decides).
+    ("belongs to privatecar", "our-defect",
+     "The insurer's records say the registration number we sent is a CAR. On "
+     "the don't-know-number journey the app sends a made-up number (RTO + "
+     "'-AB-1111', Saarthi tw-dont-know-number.component.ts:438-440), and that "
+     "number is real somewhere. Ours to fix: the placeholder must not be a "
+     "real registration."),
     ("getcalculatedpremium", "our-defect",
      "Premium calculation failed inside our integration."),
+    # Newtonsoft's wording when our code parses an empty or non-JSON answer.
+    # Seen from ICICI on every journey, 2026-09-30.
+    ("error reading jobject", "our-defect",
+     "Our code crashed reading the insurer's answer (empty or not JSON) and "
+     "showed the raw exception. Even if the insurer sent nothing, handling "
+     "that is ours."),
     ("no error message provided", "unknown",
      "The insurer declined without saying why - nothing to act on, but worth "
      "counting if it persists."),
     ("timeout", "insurer-down",
      "The insurer did not answer in time."),
+    # BAJAJ, live 2026-09-30: "Error in Service ~~ I/O error on POST request
+    # for https://htauth.preprod.bajajgeneral.com/... peer not authenticated".
+    # Their service could not reach their own login server.
+    ("peer not authenticated", "insurer-down",
+     "The insurer's service could not reach its own auth server (SSL). Theirs."),
+    ("i/o error on", "insurer-down",
+     "The insurer's service failed calling one of its own systems. Theirs."),
 )
 
 
@@ -219,7 +243,7 @@ class QuoteListPage:
         otherwise we would read a half-filled page and wrongly report the slower
         insurers as missing.
         """
-        self.page.wait_for_url(f"**{self.URL_MARKER}*", timeout=timeout_ms)
+        self.page.wait_for_url(lambda u: routes.on(u, "result"), timeout=timeout_ms)
         self.page.locator(self.CARD).first.wait_for(state="attached", timeout=timeout_ms)
 
         # Poll often, settle quickly. Insurers answer at different speeds, so we
@@ -248,7 +272,7 @@ class QuoteListPage:
         Still bounded: if the insurer never shows we wait the full timeout and
         return None, so "not offered" stays a real answer rather than a hang.
         """
-        self.page.wait_for_url(f"**{self.URL_MARKER}*", timeout=timeout_ms)
+        self.page.wait_for_url(lambda u: routes.on(u, "result"), timeout=timeout_ms)
         waited = 0
         while waited < timeout_ms:
             for quote in self.quotes():
@@ -335,14 +359,61 @@ class QuoteListPage:
                 f"about the insurer."
             )
 
+        self._raise_if_logged_out(insurer)
         card.locator(".buy-now-btn").first.click(timeout=20_000)
         self.page.wait_for_timeout(2500)
 
-        # Buy Now opens a confirm dialog rather than navigating straight on.
+        # Buy Now usually opens the NCB confirmation box first
+        # (tw-result.component.ts:602-612, 'ncb-confirmation-popup'). There is
+        # no NCB to confirm on a Third Party policy, so there the app goes
+        # straight on to KYC - waiting for a Confirm that never comes failed
+        # every Third Party journey (2026-10-01). Either ending is fine.
         confirm = self.page.get_by_role("button", name="Confirm").first
-        confirm.wait_for(state="visible", timeout=20_000)
-        confirm.click()
-        self.page.wait_for_timeout(3000)
+        waited = 0
+        while waited < 20_000:
+            if not routes.on(self.page.url, "result"):
+                return                      # already on its way to KYC
+            try:
+                if confirm.is_visible():
+                    confirm.click()
+                    self.page.wait_for_timeout(3000)
+                    return
+            except Exception:
+                pass
+            self.page.wait_for_timeout(500)
+            waited += 500
+        raise LookupError(
+            f"Pressed Buy Now on {insurer}, but neither the confirmation box nor "
+            f"the KYC page appeared in 20s. Still on: {self.page.url}")
+
+    def _raise_if_logged_out(self, insurer: str) -> None:
+        """
+        The app's "Login Required" box over the quote list, said plainly.
+
+        Saarthi opens it whenever one of its OWN calls answers 401 (HTTP, or
+        StatusCode 401 inside a 200 - core/interceptors/error.interceptor.ts),
+        and it wipes the login as it does. On 2026-10-05 that call was the quote
+        save the result page makes after the last insurer answers
+        (api/v2/Client/MailQuotation on the buy API, :50251), answering
+        "Invalid user id" - for bikes too. A bike usually escapes because Buy
+        Now is pressed before its long list of insurers is done; a car's three
+        insurers are done in seconds, so the box is already up.
+        """
+        try:
+            showing = self.page.get_by_text("Login Required", exact=True).first.is_visible()
+        except Exception:
+            showing = False
+        if showing:
+            raise auth.SessionRejected(
+                f"Cannot press Buy Now on {insurer}: the app has put up its "
+                f"'Login Required' box and logged us out.\n"
+                f"  It does that when one of its own API calls answers 401. Look in "
+                f"this run's api-responses.log for StatusCode 401 - on 2026-10-05 it "
+                f"was the quote save (api/v2/Client/MailQuotation, buy API :50251) "
+                f"answering 'Invalid user id' to a saved token the quote API still "
+                f"accepted.\n"
+                f"  Not this insurer and not the test: a stale login. A fresh one "
+                f"fixed it.")
 
     def _card_for(self, insurer: str):
         """

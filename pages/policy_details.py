@@ -13,6 +13,19 @@ One gotcha worth naming: "Comprehensive" appears TWICE on this screen once it is
 fully expanded - as the required policy type (value CP) and as the previous
 policy type (value 1). We disambiguate by radio group rather than by label,
 because label alone silently picks the wrong one.
+
+Values are NOT unique either, which the first version assumed. Expiry status
+and previous policy type both use "1", "2" and "3" (Saarthi
+tw-dont-know-number.component.html:300 and :378), so "the first radio with
+value 2" meant "Expired within 90 Days" even when we wanted previous policy
+"Third Party". Every radio is therefore picked inside its own
+formcontrolname group.
+
+What the form offers depends on the vehicle's age (component.ts:1198-1212):
+OD Only for bikes up to 4 years old, Comprehensive up to 25 years, Third Party
+always. "Expired more than 90 Days" hides the previous insurer and type.
+Private cars (/private-car/dontknownumber, same controls): Comprehensive only up
+to 14 years, OD Only up to 4 (pc-dont-know-number.component.ts:929-943).
 """
 from __future__ import annotations
 
@@ -26,7 +39,14 @@ POLICY_TYPES = {"Comprehensive": "CP", "Third Party": "TP", "OD Only": "OD"}
 EXPIRY_STATUSES = {"Not Expired": "1",
                    "Expired within 90 Days": "2",
                    "Expired more than 90 Days": "3"}
-PREVIOUS_POLICY_TYPES = {"Comprehensive": "1", "Third Party": "2"}
+# "OD Only" is offered as a previous type only when the NEW policy is OD Only.
+PREVIOUS_POLICY_TYPES = {"Comprehensive": "1", "Third Party": "2", "OD Only": "3"}
+
+# The radio groups, by formcontrolname (the app's own spelling).
+POLICY_GROUP = "reqPolicyType"
+REMEMBER_GROUP = "remeberPrePolicy"
+EXPIRY_GROUP = "prvPoliExpSts"
+PREVIOUS_TYPE_GROUP = "prvPolicyType"
 
 
 @dataclass
@@ -45,8 +65,13 @@ class PolicyDetailsPage:
     def __init__(self, page: Page):
         self.page = page
 
+    # The marker that this screen is up. "Third Party" because it is the one
+    # policy type ALWAYS offered: a car over 14 years old gets no Comprehensive
+    # button at all, and waiting for one timed out (live, 2026-10-05).
+    MARKER = "Third Party"
+
     def is_showing(self) -> bool:
-        return self.page.get_by_role("radio", name="Comprehensive").count() > 0
+        return self.page.get_by_role("radio", name=self.MARKER).count() > 0
 
     def wait_until_loaded(self, timeout_ms: int = 30_000) -> "PolicyDetailsPage":
         """
@@ -57,7 +82,7 @@ class PolicyDetailsPage:
         on a slow day, too long and every run pays for the worst case. Waiting
         for the real marker is faster AND more reliable.
         """
-        self.page.get_by_role("radio", name="Comprehensive").first.wait_for(
+        self.page.get_by_role("radio", name=self.MARKER).first.wait_for(
             state="visible", timeout=timeout_ms)
         return self
 
@@ -66,27 +91,35 @@ class PolicyDetailsPage:
             raise ValueError(f"Unknown policy type {choice.policy_type!r}. "
                              f"Expected: {', '.join(POLICY_TYPES)}")
 
-        self._radio_by_value(POLICY_TYPES[choice.policy_type])
+        self._radio_by_value(POLICY_TYPES[choice.policy_type], POLICY_GROUP)
         self.page.wait_for_timeout(1500)
 
         # Third-party-only journeys never ask about the previous policy.
         if not self._asks_about_previous_policy():
             return self
 
-        self._radio_by_value("true" if choice.remembers_previous else "false")
+        self._radio_by_value("true" if choice.remembers_previous else "false",
+                             REMEMBER_GROUP)
         self.page.wait_for_timeout(1500)
 
         if not choice.remembers_previous:
             return self
 
-        self._radio_by_value(EXPIRY_STATUSES[choice.previous_expiry_status])
+        self._radio_by_value(EXPIRY_STATUSES[choice.previous_expiry_status],
+                             EXPIRY_GROUP)
         self.page.wait_for_timeout(800)
+
+        # Lapsed for more than 90 days: the app hides the previous insurer and
+        # type (html:317-319) - there is nothing more to answer.
+        if choice.previous_expiry_status == "Expired more than 90 Days":
+            return self
 
         ui.autocomplete(self.page, self.PREV_INSURER,
                         choice.previous_insurer_search, choice.previous_insurer)
         self.page.wait_for_timeout(1200)
 
-        self._radio_by_value(PREVIOUS_POLICY_TYPES[choice.previous_policy_type])
+        self._radio_by_value(PREVIOUS_POLICY_TYPES[choice.previous_policy_type],
+                             PREVIOUS_TYPE_GROUP)
         self.page.wait_for_timeout(800)
         return self
 
@@ -95,17 +128,30 @@ class PolicyDetailsPage:
 
     # ----------------------------------------------------------------- helpers
 
-    def _radio_by_value(self, value: str) -> None:
+    def _radio_by_value(self, value: str, group: str = "") -> None:
         """
-        Select by the radio's value attribute rather than its label.
+        Select by the radio's value attribute, inside its own group.
 
-        Values are unique across the screen; labels are not ("Comprehensive"
-        and "Yes"/"No" each appear more than once). Angular's group names are
-        auto-generated and would shift if the form were reordered, so value is
-        the only stable, unambiguous handle.
+        Labels repeat ("Comprehensive" twice, "Yes"/"No" often) and so do
+        values ("1", "2", "3" in two groups), so neither alone is safe. The
+        formcontrolname on the mat-radio-group is the app's own name for the
+        question, which makes group + value unambiguous. Without a group, or if
+        the group is not found, fall back to the first radio with that value.
         """
-        self.page.locator(f'input[type="radio"][value="{value}"]').first.check(
-            timeout=ui.FIELD_TIMEOUT_MS)
+        radio = f'input[type="radio"][value="{value}"]'
+        if group:
+            scoped = self.page.locator(f'[formcontrolname="{group}"] {radio}')
+            if scoped.count():
+                scoped.first.check(timeout=ui.FIELD_TIMEOUT_MS)
+                return
+        self.page.locator(radio).first.check(timeout=ui.FIELD_TIMEOUT_MS)
+
+    def offers_policy_type(self, policy_type: str) -> bool:
+        """Is this policy type on offer? It depends on the vehicle's age."""
+        value = POLICY_TYPES.get(policy_type, "")
+        return self.page.locator(
+            f'[formcontrolname="{POLICY_GROUP}"] input[type="radio"]'
+            f'[value="{value}"]').count() > 0
 
     def _asks_about_previous_policy(self) -> bool:
         return self.page.get_by_text(
